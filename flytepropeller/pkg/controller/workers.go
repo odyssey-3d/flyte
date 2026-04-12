@@ -133,10 +133,18 @@ func (w *WorkerPool) Run(ctx context.Context, threadiness int, synced ...cache.I
 	logger.Info(ctx, "Starting FlyteWorkflow controller")
 	w.metrics.WorkersRestarted.Inc()
 
-	// Wait for the caches to be synced before starting workers
+	// Wait for the caches to be synced before starting workers.
+	// Use a timeout to avoid hanging forever if an informer fails to sync —
+	// this can happen on execution-only clusters where the API server is slow.
 	logger.Info(ctx, "Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(ctx.Done(), synced...); !ok {
-		return fmt.Errorf("failed to wait for caches to sync")
+	syncCtx, syncCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer syncCancel()
+	if ok := cache.WaitForCacheSync(syncCtx.Done(), synced...); !ok {
+		// Log which synced functions are still false for diagnostics
+		for i, s := range synced {
+			logger.Infof(ctx, "Informer synced[%d] = %v", i, s())
+		}
+		return fmt.Errorf("failed to wait for caches to sync (timed out after 2m)")
 	}
 
 	logger.Infof(ctx, "Starting workers [%d]", threadiness)

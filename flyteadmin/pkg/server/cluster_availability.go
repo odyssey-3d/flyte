@@ -54,10 +54,11 @@ type activeExecutionSummary struct {
 }
 
 type nodeSummary struct {
-	Total       int              `json:"total"`
-	Ready       int              `json:"ready"`
-	Schedulable int              `json:"schedulable"`
-	Groups      []nodeSkuSummary `json:"groups"`
+	Total        int                      `json:"total"`
+	Ready        int                      `json:"ready"`
+	Schedulable  int                      `json:"schedulable"`
+	Groups       []nodeSkuSummary         `json:"groups"`
+	CachedImages []nodeCachedImageSummary `json:"cached_images"`
 }
 
 type nodeSkuSummary struct {
@@ -68,10 +69,24 @@ type nodeSkuSummary struct {
 	Allocatable resourceSummary `json:"allocatable"`
 }
 
+type nodeCachedImageSummary struct {
+	Node       string               `json:"node"`
+	SKU        string               `json:"sku"`
+	ImageCount int                  `json:"image_count"`
+	ImageBytes int64                `json:"image_bytes"`
+	TopImages  []cachedImageSummary `json:"top_images"`
+}
+
+type cachedImageSummary struct {
+	Names     []string `json:"names"`
+	SizeBytes int64    `json:"size_bytes"`
+}
+
 type resourceSummary struct {
-	CPUCores    float64 `json:"cpu_cores"`
-	MemoryBytes int64   `json:"memory_bytes"`
-	GPUs        int64   `json:"gpus"`
+	CPUCores              float64 `json:"cpu_cores"`
+	MemoryBytes           int64   `json:"memory_bytes"`
+	GPUs                  int64   `json:"gpus"`
+	EphemeralStorageBytes int64   `json:"ephemeral_storage_bytes"`
 }
 
 type podPhaseSummary struct {
@@ -164,6 +179,7 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 	result.Nodes.Total = len(nodes.Items)
 
 	nodeGroups := map[string]*nodeSkuSummary{}
+	nodeCachedImages := make([]nodeCachedImageSummary, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
 		sku := getNodeSKU(node)
 		group, ok := nodeGroups[sku]
@@ -184,8 +200,10 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 			addNodeAllocatable(&result.Allocatable, node)
 			addNodeAllocatable(&group.Allocatable, node)
 		}
+		nodeCachedImages = append(nodeCachedImages, summarizeNodeCachedImages(node, sku))
 	}
 	result.Nodes.Groups = sortNodeGroups(nodeGroups)
+	result.Nodes.CachedImages = sortNodeCachedImages(nodeCachedImages)
 
 	flyteNamespaces, err := listFlyteNamespaces(ctx, clientset)
 	if err != nil {
@@ -276,6 +294,56 @@ func sortNodeGroups(groups map[string]*nodeSkuSummary) []nodeSkuSummary {
 	return result
 }
 
+func summarizeNodeCachedImages(node corev1.Node, sku string) nodeCachedImageSummary {
+	images := make([]corev1.ContainerImage, len(node.Status.Images))
+	copy(images, node.Status.Images)
+	sort.SliceStable(images, func(i, j int) bool {
+		if images[i].SizeBytes != images[j].SizeBytes {
+			return images[i].SizeBytes > images[j].SizeBytes
+		}
+		return firstImageName(images[i].Names) < firstImageName(images[j].Names)
+	})
+
+	result := nodeCachedImageSummary{
+		Node:       node.Name,
+		SKU:        sku,
+		ImageCount: len(images),
+	}
+	for _, image := range images {
+		result.ImageBytes += image.SizeBytes
+	}
+
+	const maxTopImages = 5
+	for i, image := range images {
+		if i >= maxTopImages {
+			break
+		}
+		result.TopImages = append(result.TopImages, cachedImageSummary{
+			Names:     image.Names,
+			SizeBytes: image.SizeBytes,
+		})
+	}
+
+	return result
+}
+
+func sortNodeCachedImages(images []nodeCachedImageSummary) []nodeCachedImageSummary {
+	sort.SliceStable(images, func(i, j int) bool {
+		if images[i].ImageBytes != images[j].ImageBytes {
+			return images[i].ImageBytes > images[j].ImageBytes
+		}
+		return images[i].Node < images[j].Node
+	})
+	return images
+}
+
+func firstImageName(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
 func isNodeReady(node corev1.Node) bool {
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady {
@@ -291,6 +359,9 @@ func addNodeAllocatable(summary *resourceSummary, node corev1.Node) {
 	}
 	if memory, ok := node.Status.Allocatable[corev1.ResourceMemory]; ok {
 		summary.MemoryBytes += memory.Value()
+	}
+	if ephemeralStorage, ok := node.Status.Allocatable[corev1.ResourceEphemeralStorage]; ok {
+		summary.EphemeralStorageBytes += ephemeralStorage.Value()
 	}
 	if gpu, ok := node.Status.Allocatable[corev1.ResourceName("nvidia.com/gpu")]; ok {
 		summary.GPUs += gpu.Value()
@@ -402,6 +473,9 @@ func addResourceList(summary *resourceSummary, resources corev1.ResourceList) {
 	}
 	if memory, ok := resources[corev1.ResourceMemory]; ok {
 		summary.MemoryBytes += memory.Value()
+	}
+	if ephemeralStorage, ok := resources[corev1.ResourceEphemeralStorage]; ok {
+		summary.EphemeralStorageBytes += ephemeralStorage.Value()
 	}
 	if gpu, ok := resources[corev1.ResourceName("nvidia.com/gpu")]; ok {
 		summary.GPUs += gpu.Value()

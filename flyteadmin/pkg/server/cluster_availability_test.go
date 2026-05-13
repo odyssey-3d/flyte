@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestGetNodeSKU(t *testing.T) {
@@ -59,5 +60,56 @@ func TestGetNodeSKU(t *testing.T) {
 				t.Fatalf("getNodeSKU() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestAddResourceListIncludesFirstClassResources(t *testing.T) {
+	summary := resourceSummary{}
+	addResourceList(&summary, corev1.ResourceList{
+		corev1.ResourceCPU:                    resource.MustParse("2500m"),
+		corev1.ResourceMemory:                 resource.MustParse("8Gi"),
+		corev1.ResourceEphemeralStorage:       resource.MustParse("100Gi"),
+		corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("4"),
+	})
+
+	if summary.CPUCores != 2.5 {
+		t.Fatalf("CPUCores = %v, want 2.5", summary.CPUCores)
+	}
+	if summary.MemoryBytes != 8*1024*1024*1024 {
+		t.Fatalf("MemoryBytes = %v, want 8Gi", summary.MemoryBytes)
+	}
+	if summary.EphemeralStorageBytes != 100*1024*1024*1024 {
+		t.Fatalf("EphemeralStorageBytes = %v, want 100Gi", summary.EphemeralStorageBytes)
+	}
+	if summary.GPUs != 4 {
+		t.Fatalf("GPUs = %v, want 4", summary.GPUs)
+	}
+}
+
+func TestSummarizeNodeCachedImages(t *testing.T) {
+	node := corev1.Node{}
+	node.Name = "node-a"
+	node.Status.Images = []corev1.ContainerImage{
+		{Names: []string{"repo/small:latest"}, SizeBytes: 10},
+		{Names: []string{"repo/large:latest", "repo/large@sha256:abc"}, SizeBytes: 30},
+		{Names: []string{"repo/medium:latest"}, SizeBytes: 20},
+	}
+
+	summary := summarizeNodeCachedImages(node, "c1a.16x")
+
+	if summary.Node != "node-a" {
+		t.Fatalf("Node = %q, want node-a", summary.Node)
+	}
+	if summary.SKU != "c1a.16x" {
+		t.Fatalf("SKU = %q, want c1a.16x", summary.SKU)
+	}
+	if summary.ImageCount != 3 {
+		t.Fatalf("ImageCount = %v, want 3", summary.ImageCount)
+	}
+	if summary.ImageBytes != 60 {
+		t.Fatalf("ImageBytes = %v, want 60", summary.ImageBytes)
+	}
+	if summary.TopImages[0].Names[0] != "repo/large:latest" {
+		t.Fatalf("largest image = %q, want repo/large:latest", summary.TopImages[0].Names[0])
 	}
 }

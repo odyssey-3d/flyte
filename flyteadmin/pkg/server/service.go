@@ -199,7 +199,7 @@ func healthCheckFunc(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func newHTTPServer(ctx context.Context, pluginRegistry *plugins.Registry, cfg *config.ServerConfig, _ *authConfig.Config, authCtx interfaces.AuthenticationContext,
+func newHTTPServer(ctx context.Context, pluginRegistry *plugins.Registry, cfg *config.ServerConfig, authCfg *authConfig.Config, authCtx interfaces.AuthenticationContext,
 	additionalHandlers map[string]func(http.ResponseWriter, *http.Request),
 	grpcAddress string, grpcConnectionOpts ...grpc.DialOption) (*http.ServeMux, error) {
 
@@ -210,7 +210,8 @@ func newHTTPServer(ctx context.Context, pluginRegistry *plugins.Registry, cfg *c
 	for p, f := range additionalHandlers {
 		mux.HandleFunc(p, f)
 	}
-	mux.HandleFunc(clusterAvailabilityPath, getClusterAvailabilityHandler(ctx, authCtx, cfg.Security.UseAuth))
+	requireClusterAvailabilityAuth := cfg.Security.UseAuth && (authCfg == nil || !authCfg.DisableForHTTP)
+	mux.HandleFunc(clusterAvailabilityPath, getClusterAvailabilityHandler(ctx, authCtx, requireClusterAvailabilityAuth))
 
 	// Register healthcheck
 	mux.HandleFunc("/healthcheck", healthCheckFunc)

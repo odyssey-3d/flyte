@@ -210,6 +210,7 @@ func newHTTPServer(ctx context.Context, pluginRegistry *plugins.Registry, cfg *c
 	for p, f := range additionalHandlers {
 		mux.HandleFunc(p, f)
 	}
+	mux.HandleFunc(clusterAvailabilityPath, getClusterAvailabilityHandler(ctx, authCtx, cfg.Security.UseAuth))
 
 	// Register healthcheck
 	mux.HandleFunc("/healthcheck", healthCheckFunc)

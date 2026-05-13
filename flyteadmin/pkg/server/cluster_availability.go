@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -212,15 +213,50 @@ func getNodeSKU(node corev1.Node) string {
 	for _, label := range []string{
 		corev1.LabelInstanceTypeStable,
 		corev1.LabelInstanceType,
+	} {
+		if value := node.Labels[label]; value != "" {
+			return value
+		}
+	}
+	if value := getNodeSKUFromCrusoeLabels(node.Labels); value != "" {
+		return value
+	}
+	for _, label := range []string{
 		"odyssey.systems/gpu-type",
-		"crusoe.ai/nodepool.name",
 		"crusoe.ai/instance.class",
+		"crusoe.ai/nodepool.name",
 	} {
 		if value := node.Labels[label]; value != "" {
 			return value
 		}
 	}
 	return "unknown"
+}
+
+func getNodeSKUFromCrusoeLabels(labels map[string]string) string {
+	instanceClass := labels["crusoe.ai/instance.class"]
+	nodepool := labels["crusoe.ai/nodepool.name"]
+	if instanceClass == "" || nodepool == "" {
+		return ""
+	}
+
+	parts := strings.Split(nodepool, "-")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	size := parts[len(parts)-1]
+	if !strings.HasSuffix(size, "x") {
+		return ""
+	}
+
+	for _, char := range strings.TrimSuffix(size, "x") {
+		if char < '0' || char > '9' {
+			return ""
+		}
+	}
+
+	return fmt.Sprintf("%s.%s", instanceClass, size)
 }
 
 func sortNodeGroups(groups map[string]*nodeSkuSummary) []nodeSkuSummary {

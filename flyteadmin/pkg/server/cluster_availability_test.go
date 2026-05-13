@@ -1,10 +1,14 @@
 package server
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestGetNodeSKU(t *testing.T) {
@@ -107,6 +111,63 @@ func TestGetNodeSKUFallsBackToAllocatableShape(t *testing.T) {
 
 	if got := getNodeSKU(node); got != "15.5 CPU / 32 GiB RAM" {
 		t.Fatalf("getNodeSKU() = %q, want allocatable shape", got)
+	}
+}
+
+func TestCrusoeClusterHelpers(t *testing.T) {
+	node := corev1.Node{}
+	node.Name = "np-123.us-east1-a.compute.internal"
+	node.Labels = map[string]string{
+		"crusoe.ai/instance.id": "instance-id",
+	}
+
+	if !isCrusoeOnDemandNode(node) {
+		t.Fatal("expected Crusoe node to be detected as on-demand")
+	}
+	if got := getNodeRegion(node); got != "us-east1-a" {
+		t.Fatalf("getNodeRegion() = %q, want us-east1-a", got)
+	}
+	if !isCrusoeCapacitySKU("l40s-48gb.10x") {
+		t.Fatal("expected l40s-48gb.10x to be a Crusoe capacity SKU")
+	}
+	if isCrusoeCapacitySKU("8x NVIDIA RTX PRO 6000 Blackwell Server Edition") {
+		t.Fatal("did not expect display-only GPU product name to be a Crusoe capacity SKU")
+	}
+}
+
+func TestResolveCrusoeCredentialsFromSecret(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      crusoeSecretName,
+			Namespace: crusoeSecretNamespace,
+		},
+		Data: map[string][]byte{
+			"CRUSOE_ACCESS_KEY": []byte("access"),
+			"CRUSOE_SECRET_KEY": []byte("c2VjcmV0"),
+		},
+	})
+
+	credentials, err := resolveCrusoeCredentials(context.Background(), client)
+	if err != nil {
+		t.Fatalf("resolveCrusoeCredentials() returned error: %v", err)
+	}
+	if credentials.AccessKey != "access" || credentials.SecretKey != "c2VjcmV0" {
+		t.Fatalf("resolveCrusoeCredentials() = %+v, want secret credentials", credentials)
+	}
+}
+
+func TestGenerateCrusoeSignature(t *testing.T) {
+	signature, err := generateCrusoeSignature("c2VjcmV0", "/v1alpha5/capacities", "", "GET", "2025-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("generateCrusoeSignature() returned error: %v", err)
+	}
+	if signature == "" {
+		t.Fatal("expected non-empty signature")
+	}
+	for _, char := range signature {
+		if !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", char) {
+			t.Fatalf("signature contains non-base64url character %q", char)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,11 +71,12 @@ type nodeSkuSummary struct {
 }
 
 type nodeCachedImageSummary struct {
-	Node       string               `json:"node"`
-	SKU        string               `json:"sku"`
-	ImageCount int                  `json:"image_count"`
-	ImageBytes int64                `json:"image_bytes"`
-	TopImages  []cachedImageSummary `json:"top_images"`
+	Node        string               `json:"node"`
+	SKU         string               `json:"sku"`
+	Allocatable resourceSummary      `json:"allocatable"`
+	ImageCount  int                  `json:"image_count"`
+	ImageBytes  int64                `json:"image_bytes"`
+	TopImages   []cachedImageSummary `json:"top_images"`
 }
 
 type cachedImageSummary struct {
@@ -228,19 +230,26 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 }
 
 func getNodeSKU(node corev1.Node) string {
+	if value := getNodeSKUFromCrusoeLabels(node.Labels); value != "" {
+		return value
+	}
+	if value := getNodeSKUFromAcceleratorLabels(node); value != "" {
+		return value
+	}
+	if value := node.Labels["odyssey.systems/gpu-type"]; value != "" {
+		return value
+	}
 	for _, label := range []string{
 		corev1.LabelInstanceTypeStable,
 		corev1.LabelInstanceType,
 	} {
 		if value := node.Labels[label]; value != "" {
-			return value
+			if !isGenericInstanceType(value) {
+				return value
+			}
 		}
 	}
-	if value := getNodeSKUFromCrusoeLabels(node.Labels); value != "" {
-		return value
-	}
 	for _, label := range []string{
-		"odyssey.systems/gpu-type",
 		"crusoe.ai/instance.class",
 		"crusoe.ai/nodepool.name",
 	} {
@@ -248,7 +257,72 @@ func getNodeSKU(node corev1.Node) string {
 			return value
 		}
 	}
+	if value := getNodeSKUFromAllocatable(node); value != "" {
+		return value
+	}
 	return "unknown"
+}
+
+func isGenericInstanceType(value string) bool {
+	switch strings.ToLower(value) {
+	case "rke2", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func getNodeSKUFromAcceleratorLabels(node corev1.Node) string {
+	product := node.Labels["nvidia.com/gpu.product"]
+	if product == "" {
+		return ""
+	}
+
+	product = strings.TrimPrefix(product, "NVIDIA-")
+	product = strings.ReplaceAll(product, "-", " ")
+
+	gpus := getNodeGPUCount(node)
+	if gpus <= 0 {
+		return product
+	}
+	return fmt.Sprintf("%dx NVIDIA %s", gpus, product)
+}
+
+func getNodeGPUCount(node corev1.Node) int64 {
+	for _, resourceName := range []corev1.ResourceName{
+		corev1.ResourceName("nvidia.com/gpu"),
+		corev1.ResourceName("amd.com/gpu"),
+		corev1.ResourceName("google.com/gpu"),
+	} {
+		if gpu, ok := node.Status.Allocatable[resourceName]; ok {
+			return gpu.Value()
+		}
+	}
+
+	if value := node.Labels["nvidia.com/gpu.count"]; value != "" {
+		if count, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return count
+		}
+	}
+	return 0
+}
+
+func getNodeSKUFromAllocatable(node corev1.Node) string {
+	summary := resourceSummary{}
+	addNodeAllocatable(&summary, node)
+
+	parts := make([]string, 0, 3)
+	if summary.GPUs > 0 {
+		parts = append(parts, fmt.Sprintf("%d GPU", summary.GPUs))
+	}
+	if summary.CPUCores > 0 {
+		parts = append(parts, fmt.Sprintf("%s CPU", formatCompactFloat(summary.CPUCores)))
+	}
+	if summary.MemoryBytes > 0 {
+		parts = append(parts, fmt.Sprintf("%s RAM", formatCompactBytes(summary.MemoryBytes)))
+	}
+
+	return strings.Join(parts, " / ")
 }
 
 func getNodeSKUFromCrusoeLabels(labels map[string]string) string {
@@ -304,10 +378,14 @@ func summarizeNodeCachedImages(node corev1.Node, sku string) nodeCachedImageSumm
 		return firstImageName(images[i].Names) < firstImageName(images[j].Names)
 	})
 
+	allocatable := resourceSummary{}
+	addNodeAllocatable(&allocatable, node)
+
 	result := nodeCachedImageSummary{
-		Node:       node.Name,
-		SKU:        sku,
-		ImageCount: len(images),
+		Node:        node.Name,
+		SKU:         sku,
+		Allocatable: allocatable,
+		ImageCount:  len(images),
 	}
 	for _, image := range images {
 		result.ImageBytes += image.SizeBytes
@@ -325,6 +403,18 @@ func summarizeNodeCachedImages(node corev1.Node, sku string) nodeCachedImageSumm
 	}
 
 	return result
+}
+
+func formatCompactBytes(bytes int64) string {
+	gib := float64(bytes) / 1024 / 1024 / 1024
+	if gib >= 1024 {
+		return fmt.Sprintf("%s TiB", formatCompactFloat(gib/1024))
+	}
+	return fmt.Sprintf("%s GiB", formatCompactFloat(gib))
+}
+
+func formatCompactFloat(value float64) string {
+	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", value), "0"), ".")
 }
 
 func sortNodeCachedImages(images []nodeCachedImageSummary) []nodeCachedImageSummary {

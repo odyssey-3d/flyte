@@ -37,6 +37,16 @@ const (
 	crusoeSecretName        = "crusoe-secrets"
 )
 
+var crusoeOnDemandCapacitySKUs = []string{
+	"c1a.4x",
+	"c1a.16x",
+	"l40s-48gb.1x",
+	"l40s-48gb.2x",
+	"l40s-48gb.4x",
+	"l40s-48gb.8x",
+	"l40s-48gb.10x",
+}
+
 type clusterAvailabilityResponse struct {
 	CheckedAt string                `json:"checked_at"`
 	Clusters  []clusterAvailability `json:"clusters"`
@@ -52,7 +62,7 @@ type clusterAvailability struct {
 	Error            string                   `json:"error,omitempty"`
 	Warnings         []string                 `json:"warnings"`
 	Nodes            nodeSummary              `json:"nodes"`
-	Allocatable      resourceSummary          `json:"allocatable"`
+	FreeCapacity     resourceSummary          `json:"free_capacity"`
 	FlytePodPhases   podPhaseSummary          `json:"flyte_pod_phases"`
 	ActiveExecutions []activeExecutionSummary `json:"active_executions"`
 	CheckedAt        string                   `json:"checked_at"`
@@ -81,17 +91,17 @@ type nodeSkuSummary struct {
 	Total            int                      `json:"total"`
 	Ready            int                      `json:"ready"`
 	Schedulable      int                      `json:"schedulable"`
-	Allocatable      resourceSummary          `json:"allocatable"`
+	FreeCapacity     resourceSummary          `json:"free_capacity"`
 	OnDemandCapacity *onDemandCapacitySummary `json:"on_demand_capacity,omitempty"`
 }
 
 type nodeCachedImageSummary struct {
-	Node        string               `json:"node"`
-	SKU         string               `json:"sku"`
-	Allocatable resourceSummary      `json:"allocatable"`
-	ImageCount  int                  `json:"image_count"`
-	ImageBytes  int64                `json:"image_bytes"`
-	TopImages   []cachedImageSummary `json:"top_images"`
+	Node         string               `json:"node"`
+	SKU          string               `json:"sku"`
+	FreeCapacity resourceSummary      `json:"free_capacity"`
+	ImageCount   int                  `json:"image_count"`
+	ImageBytes   int64                `json:"image_bytes"`
+	TopImages    []cachedImageSummary `json:"top_images"`
 }
 
 type cachedImageSummary struct {
@@ -202,6 +212,15 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 	result.Reachable = true
 	result.Nodes.Total = len(nodes.Items)
 
+	podItems := []corev1.Pod{}
+	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("failed to list pods; free capacity falls back to raw node schedulable capacity: %v", err))
+	} else {
+		podItems = pods.Items
+	}
+	podRequestsByNode := summarizeAssignedPodRequests(podItems)
+
 	nodeGroups := map[string]*nodeSkuSummary{}
 	nodeCachedImages := make([]nodeCachedImageSummary, 0, len(nodes.Items))
 	crusoeOnDemand := false
@@ -229,10 +248,11 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 		if ready && !node.Spec.Unschedulable {
 			result.Nodes.Schedulable++
 			group.Schedulable++
-			addNodeAllocatable(&result.Allocatable, node)
-			addNodeAllocatable(&group.Allocatable, node)
+			freeCapacity := getNodeFreeCapacity(node, podRequestsByNode[node.Name])
+			addResourceSummary(&result.FreeCapacity, freeCapacity)
+			addResourceSummary(&group.FreeCapacity, freeCapacity)
 		}
-		nodeCachedImages = append(nodeCachedImages, summarizeNodeCachedImages(node, sku))
+		nodeCachedImages = append(nodeCachedImages, summarizeNodeCachedImages(node, sku, podRequestsByNode[node.Name]))
 	}
 	if crusoeOnDemand {
 		result.CapacityType = "on-demand"
@@ -250,18 +270,12 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 		return result
 	}
 
-	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("failed to list pods: %v", err))
-		return result
-	}
-
-	for _, pod := range pods.Items {
-		if flyteNamespaces[pod.Namespace] {
+	for _, pod := range podItems {
+		if flyteNamespaces[pod.Namespace] && isFlyteExecutionPod(pod) {
 			addPodPhase(&result.FlytePodPhases, pod.Status.Phase)
 		}
 	}
-	result.ActiveExecutions = summarizeActiveExecutions(pods.Items, flyteNamespaces)
+	result.ActiveExecutions = summarizeActiveExecutions(podItems, flyteNamespaces)
 
 	return result
 }
@@ -278,6 +292,8 @@ func addOnDemandCapacity(
 		*warnings = append(*warnings, "failed to query Crusoe capacity: region is unknown")
 		return
 	}
+
+	ensureOnDemandCapacityGroups(nodeGroups)
 
 	skus := make([]string, 0, len(nodeGroups))
 	for sku := range nodeGroups {
@@ -302,6 +318,14 @@ func addOnDemandCapacity(
 			Region:    region,
 			Available: capacities[sku],
 			CheckedAt: checkedAt.Format(time.RFC3339),
+		}
+	}
+}
+
+func ensureOnDemandCapacityGroups(nodeGroups map[string]*nodeSkuSummary) {
+	for _, sku := range crusoeOnDemandCapacitySKUs {
+		if _, ok := nodeGroups[sku]; !ok {
+			nodeGroups[sku] = &nodeSkuSummary{SKU: sku}
 		}
 	}
 }
@@ -621,8 +645,8 @@ func sortNodeGroups(groups map[string]*nodeSkuSummary) []nodeSkuSummary {
 		result = append(result, *group)
 	}
 	sort.SliceStable(result, func(i, j int) bool {
-		if result[i].Allocatable.GPUs != result[j].Allocatable.GPUs {
-			return result[i].Allocatable.GPUs > result[j].Allocatable.GPUs
+		if result[i].FreeCapacity.GPUs != result[j].FreeCapacity.GPUs {
+			return result[i].FreeCapacity.GPUs > result[j].FreeCapacity.GPUs
 		}
 		if result[i].Total != result[j].Total {
 			return result[i].Total > result[j].Total
@@ -632,7 +656,7 @@ func sortNodeGroups(groups map[string]*nodeSkuSummary) []nodeSkuSummary {
 	return result
 }
 
-func summarizeNodeCachedImages(node corev1.Node, sku string) nodeCachedImageSummary {
+func summarizeNodeCachedImages(node corev1.Node, sku string, requested resourceSummary) nodeCachedImageSummary {
 	images := make([]corev1.ContainerImage, len(node.Status.Images))
 	copy(images, node.Status.Images)
 	sort.SliceStable(images, func(i, j int) bool {
@@ -642,14 +666,11 @@ func summarizeNodeCachedImages(node corev1.Node, sku string) nodeCachedImageSumm
 		return firstImageName(images[i].Names) < firstImageName(images[j].Names)
 	})
 
-	allocatable := resourceSummary{}
-	addNodeAllocatable(&allocatable, node)
-
 	result := nodeCachedImageSummary{
-		Node:        node.Name,
-		SKU:         sku,
-		Allocatable: allocatable,
-		ImageCount:  len(images),
+		Node:         node.Name,
+		SKU:          sku,
+		FreeCapacity: getNodeFreeCapacity(node, requested),
+		ImageCount:   len(images),
 	}
 	for _, image := range images {
 		result.ImageBytes += image.SizeBytes
@@ -717,9 +738,99 @@ func addNodeAllocatable(summary *resourceSummary, node corev1.Node) {
 	if ephemeralStorage, ok := node.Status.Allocatable[corev1.ResourceEphemeralStorage]; ok {
 		summary.EphemeralStorageBytes += ephemeralStorage.Value()
 	}
-	if gpu, ok := node.Status.Allocatable[corev1.ResourceName("nvidia.com/gpu")]; ok {
-		summary.GPUs += gpu.Value()
+	for _, resourceName := range []corev1.ResourceName{
+		corev1.ResourceName("nvidia.com/gpu"),
+		corev1.ResourceName("amd.com/gpu"),
+		corev1.ResourceName("google.com/gpu"),
+	} {
+		if gpu, ok := node.Status.Allocatable[resourceName]; ok {
+			summary.GPUs += gpu.Value()
+		}
 	}
+}
+
+func getNodeFreeCapacity(node corev1.Node, requested resourceSummary) resourceSummary {
+	freeCapacity := resourceSummary{}
+	addNodeAllocatable(&freeCapacity, node)
+	subtractResourceSummary(&freeCapacity, requested)
+	return freeCapacity
+}
+
+func summarizeAssignedPodRequests(pods []corev1.Pod) map[string]resourceSummary {
+	requestsByNode := map[string]resourceSummary{}
+	for _, pod := range pods {
+		if pod.Spec.NodeName == "" || isTerminalPod(pod) {
+			continue
+		}
+
+		requested := requestsByNode[pod.Spec.NodeName]
+		addResourceSummary(&requested, getPodRequests(pod))
+		requestsByNode[pod.Spec.NodeName] = requested
+	}
+	return requestsByNode
+}
+
+func isTerminalPod(pod corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+func getPodRequests(pod corev1.Pod) resourceSummary {
+	appRequests := resourceSummary{}
+	for _, container := range pod.Spec.Containers {
+		addResourceList(&appRequests, container.Resources.Requests)
+	}
+
+	initRequests := resourceSummary{}
+	for _, container := range pod.Spec.InitContainers {
+		containerRequests := resourceSummary{}
+		addResourceList(&containerRequests, container.Resources.Requests)
+		maxResourceSummary(&initRequests, containerRequests)
+	}
+
+	result := maxResourceSummaries(appRequests, initRequests)
+	addResourceList(&result, pod.Spec.Overhead)
+	return result
+}
+
+func addResourceSummary(summary *resourceSummary, value resourceSummary) {
+	summary.CPUCores += value.CPUCores
+	summary.MemoryBytes += value.MemoryBytes
+	summary.GPUs += value.GPUs
+	summary.EphemeralStorageBytes += value.EphemeralStorageBytes
+}
+
+func subtractResourceSummary(summary *resourceSummary, value resourceSummary) {
+	summary.CPUCores = maxFloat64(summary.CPUCores-value.CPUCores, 0)
+	summary.MemoryBytes = maxInt64(summary.MemoryBytes-value.MemoryBytes, 0)
+	summary.GPUs = maxInt64(summary.GPUs-value.GPUs, 0)
+	summary.EphemeralStorageBytes = maxInt64(summary.EphemeralStorageBytes-value.EphemeralStorageBytes, 0)
+}
+
+func maxResourceSummaries(left, right resourceSummary) resourceSummary {
+	return resourceSummary{
+		CPUCores:              maxFloat64(left.CPUCores, right.CPUCores),
+		MemoryBytes:           maxInt64(left.MemoryBytes, right.MemoryBytes),
+		GPUs:                  maxInt64(left.GPUs, right.GPUs),
+		EphemeralStorageBytes: maxInt64(left.EphemeralStorageBytes, right.EphemeralStorageBytes),
+	}
+}
+
+func maxResourceSummary(summary *resourceSummary, value resourceSummary) {
+	*summary = maxResourceSummaries(*summary, value)
+}
+
+func maxFloat64(left, right float64) float64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func listFlyteNamespaces(ctx context.Context, clientset kubernetes.Interface) (map[string]bool, error) {
@@ -760,14 +871,13 @@ func summarizeActiveExecutions(pods []corev1.Pod, flyteNamespaces map[string]boo
 		if !flyteNamespaces[pod.Namespace] || (pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodPending) {
 			continue
 		}
+		if !isFlyteExecutionPod(pod) {
+			continue
+		}
 
 		project := pod.Labels["project"]
 		domain := pod.Labels["domain"]
 		name := pod.Labels["execution-id"]
-		if project == "" || domain == "" || name == "" {
-			continue
-		}
-
 		key := project + "/" + domain + "/" + name
 		execution, ok := executions[key]
 		if !ok {
@@ -806,19 +916,15 @@ func summarizeActiveExecutions(pods []corev1.Pod, flyteNamespaces map[string]boo
 		}
 		return result[i].Name < result[j].Name
 	})
-	if len(result) > 5 {
-		return result[:5]
-	}
 	return result
 }
 
+func isFlyteExecutionPod(pod corev1.Pod) bool {
+	return pod.Labels["project"] != "" && pod.Labels["domain"] != "" && pod.Labels["execution-id"] != ""
+}
+
 func addPodRequests(summary *resourceSummary, pod corev1.Pod) {
-	for _, container := range pod.Spec.Containers {
-		addResourceList(summary, container.Resources.Requests)
-	}
-	for _, container := range pod.Spec.InitContainers {
-		addResourceList(summary, container.Resources.Requests)
-	}
+	addResourceSummary(summary, getPodRequests(pod))
 }
 
 func addResourceList(summary *resourceSummary, resources corev1.ResourceList) {

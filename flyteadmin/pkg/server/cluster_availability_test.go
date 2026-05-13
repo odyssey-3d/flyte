@@ -99,6 +99,145 @@ func TestAddResourceListIncludesFirstClassResources(t *testing.T) {
 	}
 }
 
+func TestSummarizeAssignedPodRequests(t *testing.T) {
+	pods := []corev1.Pod{
+		{
+			Spec: corev1.PodSpec{
+				NodeName: "node-a",
+				Containers: []corev1.Container{
+					{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:                    resource.MustParse("1500m"),
+								corev1.ResourceMemory:                 resource.MustParse("4Gi"),
+								corev1.ResourceEphemeralStorage:       resource.MustParse("20Gi"),
+								corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+							},
+						},
+					},
+					{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("2Gi"),
+							},
+						},
+					},
+				},
+				InitContainers: []corev1.Container{
+					{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("4"),
+								corev1.ResourceMemory: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+				Overhead: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("250m"),
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		{
+			Spec: corev1.PodSpec{
+				NodeName: "node-a",
+				Containers: []corev1.Container{
+					{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("10"),
+							},
+						},
+					},
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+		},
+		{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("10"),
+							},
+						},
+					},
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		},
+	}
+
+	requestsByNode := summarizeAssignedPodRequests(pods)
+	requested := requestsByNode["node-a"]
+	if requested.CPUCores != 4.25 {
+		t.Fatalf("CPUCores = %v, want 4.25", requested.CPUCores)
+	}
+	if requested.MemoryBytes != 6*1024*1024*1024 {
+		t.Fatalf("MemoryBytes = %v, want 6Gi", requested.MemoryBytes)
+	}
+	if requested.EphemeralStorageBytes != 20*1024*1024*1024 {
+		t.Fatalf("EphemeralStorageBytes = %v, want 20Gi", requested.EphemeralStorageBytes)
+	}
+	if requested.GPUs != 1 {
+		t.Fatalf("GPUs = %v, want 1", requested.GPUs)
+	}
+	if _, ok := requestsByNode[""]; ok {
+		t.Fatal("expected unassigned pending pod to be ignored")
+	}
+}
+
+func TestSummarizeActiveExecutionsRequiresExecutionLabels(t *testing.T) {
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "flytesnacks-development",
+				Labels: map[string]string{
+					"project":      "flytesnacks",
+					"domain":       "development",
+					"execution-id": "execution-a",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:                    resource.MustParse("1"),
+								corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1"),
+							},
+						},
+					},
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "flytesnacks-development",
+				Labels: map[string]string{
+					"app": "flytepropeller",
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+	}
+
+	executions := summarizeActiveExecutions(pods, map[string]bool{"flytesnacks-development": true})
+	if len(executions) != 1 {
+		t.Fatalf("len(executions) = %v, want 1", len(executions))
+	}
+	if executions[0].Name != "execution-a" {
+		t.Fatalf("execution name = %q, want execution-a", executions[0].Name)
+	}
+	if executions[0].Requested.GPUs != 1 {
+		t.Fatalf("requested GPUs = %v, want 1", executions[0].Requested.GPUs)
+	}
+}
+
 func TestGetNodeSKUFallsBackToAllocatableShape(t *testing.T) {
 	node := corev1.Node{}
 	node.Labels = map[string]string{
@@ -186,7 +325,12 @@ func TestSummarizeNodeCachedImages(t *testing.T) {
 		{Names: []string{"repo/medium:latest"}, SizeBytes: 20},
 	}
 
-	summary := summarizeNodeCachedImages(node, "c1a.16x")
+	summary := summarizeNodeCachedImages(node, "c1a.16x", resourceSummary{
+		CPUCores:              0.5,
+		MemoryBytes:           1 * 1024 * 1024 * 1024,
+		EphemeralStorageBytes: 2 * 1024 * 1024 * 1024,
+		GPUs:                  1,
+	})
 
 	if summary.Node != "node-a" {
 		t.Fatalf("Node = %q, want node-a", summary.Node)
@@ -200,17 +344,17 @@ func TestSummarizeNodeCachedImages(t *testing.T) {
 	if summary.ImageBytes != 60 {
 		t.Fatalf("ImageBytes = %v, want 60", summary.ImageBytes)
 	}
-	if summary.Allocatable.CPUCores != 2 {
-		t.Fatalf("Allocatable.CPUCores = %v, want 2", summary.Allocatable.CPUCores)
+	if summary.FreeCapacity.CPUCores != 1.5 {
+		t.Fatalf("FreeCapacity.CPUCores = %v, want 1.5", summary.FreeCapacity.CPUCores)
 	}
-	if summary.Allocatable.MemoryBytes != 4*1024*1024*1024 {
-		t.Fatalf("Allocatable.MemoryBytes = %v, want 4Gi", summary.Allocatable.MemoryBytes)
+	if summary.FreeCapacity.MemoryBytes != 3*1024*1024*1024 {
+		t.Fatalf("FreeCapacity.MemoryBytes = %v, want 3Gi", summary.FreeCapacity.MemoryBytes)
 	}
-	if summary.Allocatable.EphemeralStorageBytes != 10*1024*1024*1024 {
-		t.Fatalf("Allocatable.EphemeralStorageBytes = %v, want 10Gi", summary.Allocatable.EphemeralStorageBytes)
+	if summary.FreeCapacity.EphemeralStorageBytes != 8*1024*1024*1024 {
+		t.Fatalf("FreeCapacity.EphemeralStorageBytes = %v, want 8Gi", summary.FreeCapacity.EphemeralStorageBytes)
 	}
-	if summary.Allocatable.GPUs != 1 {
-		t.Fatalf("Allocatable.GPUs = %v, want 1", summary.Allocatable.GPUs)
+	if summary.FreeCapacity.GPUs != 0 {
+		t.Fatalf("FreeCapacity.GPUs = %v, want 0", summary.FreeCapacity.GPUs)
 	}
 	if summary.TopImages[0].Names[0] != "repo/large:latest" {
 		t.Fatalf("largest image = %q, want repo/large:latest", summary.TopImages[0].Names[0])

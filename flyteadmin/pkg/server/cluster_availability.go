@@ -53,9 +53,18 @@ type activeExecutionSummary struct {
 }
 
 type nodeSummary struct {
-	Total       int `json:"total"`
-	Ready       int `json:"ready"`
-	Schedulable int `json:"schedulable"`
+	Total       int              `json:"total"`
+	Ready       int              `json:"ready"`
+	Schedulable int              `json:"schedulable"`
+	Groups      []nodeSkuSummary `json:"groups"`
+}
+
+type nodeSkuSummary struct {
+	SKU         string          `json:"sku"`
+	Total       int             `json:"total"`
+	Ready       int             `json:"ready"`
+	Schedulable int             `json:"schedulable"`
+	Allocatable resourceSummary `json:"allocatable"`
 }
 
 type resourceSummary struct {
@@ -153,16 +162,29 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 	result.Reachable = true
 	result.Nodes.Total = len(nodes.Items)
 
+	nodeGroups := map[string]*nodeSkuSummary{}
 	for _, node := range nodes.Items {
+		sku := getNodeSKU(node)
+		group, ok := nodeGroups[sku]
+		if !ok {
+			group = &nodeSkuSummary{SKU: sku}
+			nodeGroups[sku] = group
+		}
+
+		group.Total++
 		ready := isNodeReady(node)
 		if ready {
 			result.Nodes.Ready++
+			group.Ready++
 		}
 		if ready && !node.Spec.Unschedulable {
 			result.Nodes.Schedulable++
+			group.Schedulable++
 			addNodeAllocatable(&result.Allocatable, node)
+			addNodeAllocatable(&group.Allocatable, node)
 		}
 	}
+	result.Nodes.Groups = sortNodeGroups(nodeGroups)
 
 	flyteNamespaces, err := listFlyteNamespaces(ctx, clientset)
 	if err != nil {
@@ -184,6 +206,38 @@ func checkClusterAvailability(ctx context.Context, cluster runtimeInterfaces.Clu
 	result.ActiveExecutions = summarizeActiveExecutions(pods.Items, flyteNamespaces)
 
 	return
+}
+
+func getNodeSKU(node corev1.Node) string {
+	for _, label := range []string{
+		corev1.LabelInstanceTypeStable,
+		corev1.LabelInstanceType,
+		"odyssey.systems/gpu-type",
+		"crusoe.ai/nodepool.name",
+		"crusoe.ai/instance.class",
+	} {
+		if value := node.Labels[label]; value != "" {
+			return value
+		}
+	}
+	return "unknown"
+}
+
+func sortNodeGroups(groups map[string]*nodeSkuSummary) []nodeSkuSummary {
+	result := make([]nodeSkuSummary, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, *group)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Allocatable.GPUs != result[j].Allocatable.GPUs {
+			return result[i].Allocatable.GPUs > result[j].Allocatable.GPUs
+		}
+		if result[i].Total != result[j].Total {
+			return result[i].Total > result[j].Total
+		}
+		return result[i].SKU < result[j].SKU
+	})
+	return result
 }
 
 func isNodeReady(node corev1.Node) bool {
